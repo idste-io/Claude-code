@@ -1,8 +1,1 @@
-{
-  "mcpServers": {
-    "obsidian": {
-      "command": "npx",
-      "args": ["-y", "obsidian-mcp", "/home/user/Documents/obsidian"]
-    }
-  }
-}
+{"mcpServers":{"obsidian":{"command":"npx","args":["-y","obsidian-mcp","/home/user/Documents/obsidian"]},"ollama":{"command":"npx","args":["-y","@rawveg/ollama-mcp"],"env":{"OLLAMA_HOST":"https://ollamav2.invoxio.work"}}}}
