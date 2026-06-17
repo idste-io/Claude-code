@@ -1,4 +1,4 @@
-# Ollama + Cloudflare Tunnel Tray Manager v2.1
+# Ollama + Cloudflare Tunnel Tray Manager v2.2
 # Tails Ollama's server.log (API calls, tokens) + cloudflared streams
 # Compile to EXE: Invoke-PS2EXE -InputFile ollama-tray.ps1 -OutputFile ollama-tray.exe -NoConsole -STA
 
@@ -21,16 +21,19 @@ public static class OllamaLogger {
         var path   = (string)args[0];
         var prefix = (string)args[1];
         var log    = (ArrayList)args[2];
+        var stop   = (int[])args[3];   // stop[0] != 0 means exit
         try {
-            while (!File.Exists(path))
+            while (!File.Exists(path)) {
+                if (stop[0] != 0) return;
                 Thread.Sleep(500);
+            }
             using (var fs = new FileStream(path,
                 FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete))
             {
                 fs.Seek(0, SeekOrigin.End);
                 var reader = new StreamReader(fs);
-                while (true) {
+                while (stop[0] == 0) {
                     var line = reader.ReadLine();
                     if (line != null) {
                         if (line.Length > 0)
@@ -39,7 +42,7 @@ public static class OllamaLogger {
                                 if (log.Count > 2000) log.RemoveAt(0);
                             }
                     } else {
-                        Thread.Sleep(1000);
+                        Thread.Sleep(500);
                     }
                 }
             }
@@ -63,10 +66,10 @@ public static class OllamaLogger {
         } catch {}
     }
 
-    public static Thread StartTail(string path, string prefix, ArrayList log) {
+    public static Thread StartTail(string path, string prefix, ArrayList log, int[] stop) {
         var t = new Thread(new ParameterizedThreadStart(TailFile));
         t.IsBackground = true;
-        t.Start(new object[] { path, prefix, log });
+        t.Start(new object[] { path, prefix, log, stop });
         return t;
     }
 
@@ -98,28 +101,48 @@ public static class OllamaLogger {
         }
     }
 
-    public static bool IsRunning(string name) {
-        return Process.GetProcessesByName(name).Length > 0;
+    // Wait up to timeoutMs for all processes with the given name to exit
+    public static void WaitForExit(string name, int timeoutMs) {
+        int selfId   = Process.GetCurrentProcess().Id;
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        bool any     = true;
+        while (any && DateTime.UtcNow < deadline) {
+            any = false;
+            foreach (var p in Process.GetProcessesByName(name))
+                try { if (p.Id != selfId && !p.HasExited) { any = true; break; } } catch {}
+            if (any) Thread.Sleep(100);
+        }
     }
 
-    public static bool IsAnyRunningByPrefix(string prefix) {
-        foreach (var p in Process.GetProcesses()) {
-            try {
-                if (p.ProcessName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                    && !p.HasExited) return true;
-            } catch {}
+    // Wait up to timeoutMs for all processes whose name starts with prefix to exit
+    public static void WaitForExitByPrefix(string prefix, int timeoutMs) {
+        int selfId   = Process.GetCurrentProcess().Id;
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        bool any     = true;
+        while (any && DateTime.UtcNow < deadline) {
+            any = false;
+            foreach (var p in Process.GetProcesses())
+                try {
+                    if (p.Id != selfId &&
+                        p.ProcessName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                        && !p.HasExited) { any = true; break; }
+                } catch {}
+            if (any) Thread.Sleep(100);
         }
-        return false;
+    }
+
+    public static bool IsRunning(string name) {
+        return Process.GetProcessesByName(name).Length > 0;
     }
 }
 "@
 }
 
 # ── Env vars Ollama needs ──────────────────────────────────────────────────────
-$env:OLLAMA_ORIGINS        = "*"
-$env:OLLAMA_HOST           = "0.0.0.0:11434"
-$env:OLLAMA_FLASH_ATTENTION = "0"    # disable — MMA Flash Attention kernel crashes on RTX 5060 Ti with Ollama 0.30.8
-$env:OLLAMA_NUM_PARALLEL    = "1"    # one request at a time — avoids OOM crashes on large models
+$env:OLLAMA_ORIGINS         = "*"
+$env:OLLAMA_HOST            = "0.0.0.0:11434"
+$env:OLLAMA_FLASH_ATTENTION = "0"   # MMA Flash Attention crashes on RTX 5060 Ti with Ollama 0.30.8
+$env:OLLAMA_NUM_PARALLEL    = "1"   # one request at a time — avoids OOM on large models
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 $cloudflaredExe = "C:\Program Files (x86)\cloudflared\cloudflared.exe"
@@ -128,23 +151,29 @@ $ollamaExe      = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 $ollamaLog      = "$env:LOCALAPPDATA\Ollama\server.log"
 if (-not (Test-Path $ollamaExe)) { $ollamaExe = "ollama" }
 
-# ── Thread-safe log buffer ─────────────────────────────────────────────────────
-$script:logLines     = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-$script:logForm      = $null
-$script:logLastIndex = 0
-$script:tailThread   = $null
+# ── State ──────────────────────────────────────────────────────────────────────
+$script:logLines          = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+$script:logForm           = $null
+$script:logLastIndex      = 0
+$script:ollamaProc        = $null
+$script:cfProc            = $null
+$script:tailStop          = [int[]]@(0)   # signal array — set to 1 to stop tail thread
+$script:tailThread        = $null
+$script:shuttingDown      = $false        # set true during Exit to suppress watchdog restarts
+$script:lastOllamaRestart = [DateTime]::MinValue
+$script:lastCfRestart     = [DateTime]::MinValue
+$script:hIcon             = [IntPtr]::Zero
 
 function Add-Log {
     param([string]$prefix, [string]$line)
     if ([string]::IsNullOrEmpty($line)) { return }
-    $script:logLines.Add("[$prefix] $line") | Out-Null
-    if ($script:logLines.Count -gt 2000) { $script:logLines.RemoveAt(0) }
+    lock ($script:logLines.SyncRoot) {
+        $script:logLines.Add("[$prefix] $line") | Out-Null
+        if ($script:logLines.Count -gt 2000) { $script:logLines.RemoveAt(0) }
+    }
 }
 
 # ── Process launch ─────────────────────────────────────────────────────────────
-$script:ollamaProc = $null
-$script:cfProc     = $null
-
 function Start-Ollama {
     if (-not [OllamaLogger]::IsRunning("ollama")) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -160,10 +189,12 @@ function Start-Ollama {
         $p.StartInfo = $psi
         $p.Start() | Out-Null
         $script:ollamaProc = $p
-        Start-Sleep -Seconds 2
     }
-    # Always (re)start the log tail so new server.log is picked up
-    $script:tailThread = [OllamaLogger]::StartTail($ollamaLog, "ollama", $script:logLines)
+    # (Re)start log tail only if not already alive — prevents duplicate tail threads
+    if ($script:tailThread -eq $null -or -not $script:tailThread.IsAlive) {
+        $script:tailStop[0] = 0
+        $script:tailThread  = [OllamaLogger]::StartTail($ollamaLog, "ollama", $script:logLines, $script:tailStop)
+    }
 }
 
 function Start-Tunnel {
@@ -188,22 +219,41 @@ function Start-Tunnel {
 }
 
 function Stop-All {
-    # Try tracked process objects first
+    $script:shuttingDown = $true
+
+    # Close the log window if open so it doesn't hang
+    if ($script:logForm -and $script:logForm.Visible) {
+        try { $script:logForm.Close() } catch {}
+        $script:logForm = $null
+    }
+
+    # Signal the tail thread to stop
+    $script:tailStop[0] = 1
+
+    # Kill llama-server children before killing ollama parent
+    [OllamaLogger]::KillAllByPrefix("llama-server")
+    [OllamaLogger]::WaitForExitByPrefix("llama-server", 3000)
+
+    # Kill tracked process objects
     if ($script:ollamaProc -ne $null) {
         try { if (-not $script:ollamaProc.HasExited) { $script:ollamaProc.Kill() } } catch {}
+        $script:ollamaProc = $null
     }
     if ($script:cfProc -ne $null) {
         try { if (-not $script:cfProc.HasExited) { $script:cfProc.Kill() } } catch {}
+        $script:cfProc = $null
     }
-    # Kill all by name/prefix — catches llama-server, llama-server-cuda_v13, etc.
-    [OllamaLogger]::KillAllByPrefix("llama-server")
+
+    # Kill any remaining by name
     [OllamaLogger]::KillAllByPrefix("ollama")
     [OllamaLogger]::KillAllByName("cloudflared")
-    $script:ollamaProc = $null
-    $script:cfProc     = $null
+
+    # Wait up to 3s for them to actually exit before returning
+    [OllamaLogger]::WaitForExitByPrefix("ollama", 3000)
+    [OllamaLogger]::WaitForExit("cloudflared", 2000)
 }
 
-# ── Start both ────────────────────────────────────────────────────────────────
+# ── Start both ─────────────────────────────────────────────────────────────────
 Add-Log "tray" "Starting Ollama..."
 Start-Ollama
 Add-Log "tray" "Starting cloudflared tunnel..."
@@ -211,59 +261,68 @@ Start-Tunnel
 Add-Log "tray" "Ready - ollamav2.invoxio.work"
 Add-Log "tray" "Tailing $ollamaLog"
 
-# ── Drain timer: push buffered lines into the open log window ─────────────────
+# ── Drain timer: push buffered lines into the open log window ──────────────────
 $drainTimer          = New-Object System.Windows.Forms.Timer
 $drainTimer.Interval = 3000
 $drainTimer.Add_Tick({
+    if (-not ($script:logForm -and $script:logForm.Visible)) { return }
     $count = $script:logLines.Count
-    if ($count -gt $script:logLastIndex -and $script:logForm -and $script:logForm.Visible) {
-        $tb       = $script:logForm.Tag
-        $newLines = $script:logLines.GetRange($script:logLastIndex, $count - $script:logLastIndex)
-        foreach ($line in $newLines) {
-            if ($line -match "error|ERR|fatal|FATAL|failed|panic" ) {
-                $tb.SelectionColor = [System.Drawing.Color]::OrangeRed
-            } elseif ($line -match "^\[ollama\]") {
-                if ($line -match "print_timing|prompt eval|eval time|total time|t/s") {
-                    $tb.SelectionColor = [System.Drawing.Color]::Yellow
-                } elseif ($line -match "\[GIN\]") {
-                    $tb.SelectionColor = [System.Drawing.Color]::LightGoldenrodYellow
-                } else {
-                    $tb.SelectionColor = [System.Drawing.Color]::LightCyan
-                }
-            } elseif ($line -match "^\[cloudflared\]") {
-                $tb.SelectionColor = [System.Drawing.Color]::LightGreen
+    if ($count -le $script:logLastIndex) { return }
+
+    $tb       = $script:logForm.Tag
+    $newLines = $script:logLines.GetRange($script:logLastIndex, $count - $script:logLastIndex)
+    foreach ($line in $newLines) {
+        if ($line -match "error|ERR|fatal|FATAL|failed|panic") {
+            $tb.SelectionColor = [System.Drawing.Color]::OrangeRed
+        } elseif ($line -match "^\[ollama\]") {
+            if ($line -match "print_timing|prompt eval|eval time|total time|t/s") {
+                $tb.SelectionColor = [System.Drawing.Color]::Yellow
+            } elseif ($line -match "\[GIN\]") {
+                $tb.SelectionColor = [System.Drawing.Color]::LightGoldenrodYellow
             } else {
-                $tb.SelectionColor = [System.Drawing.Color]::Gray
+                $tb.SelectionColor = [System.Drawing.Color]::LightCyan
             }
-            $tb.AppendText($line + "`n")
+        } elseif ($line -match "^\[cloudflared\]") {
+            $tb.SelectionColor = [System.Drawing.Color]::LightGreen
+        } else {
+            $tb.SelectionColor = [System.Drawing.Color]::Gray
         }
-        $tb.ScrollToCaret()
-        $script:logLastIndex = $count
+        $tb.AppendText($line + "`n")
     }
+    $tb.ScrollToCaret()
+    $script:logLastIndex = $count
 })
 $drainTimer.Start()
 
-# ── Watchdog: auto-restart Ollama or cloudflared if they crash ────────────────
+# ── Watchdog: auto-restart Ollama or cloudflared if they crash ─────────────────
 $watchdogTimer          = New-Object System.Windows.Forms.Timer
 $watchdogTimer.Interval = 30000
 $watchdogTimer.Add_Tick({
+    if ($script:shuttingDown) { return }
+
+    $now      = [DateTime]::UtcNow
+    $cooldown = [TimeSpan]::FromSeconds(60)
+
     $ollamaOk = [OllamaLogger]::IsRunning("ollama")
     $cfOk     = [OllamaLogger]::IsRunning("cloudflared")
 
-    if (-not $ollamaOk) {
+    if (-not $ollamaOk -and ($now - $script:lastOllamaRestart) -gt $cooldown) {
+        $script:lastOllamaRestart = $now
         Add-Log "watchdog" "Ollama not running — killing llama-server children and restarting..."
         [OllamaLogger]::KillAllByPrefix("llama-server")
         [OllamaLogger]::KillAllByPrefix("ollama")
-        $script:ollamaProc = $null
-        Start-Sleep -Seconds 2
+        $script:ollamaProc  = $null
+        $script:tailStop[0] = 1   # stop old tail before starting new one
+        $script:tailThread  = $null
         Start-Ollama
         $tray.ShowBalloonTip(3000, "Ollama Tunnel", "Ollama crashed — auto-restarted", [System.Windows.Forms.ToolTipIcon]::Warning)
     }
-    if (-not $cfOk) {
+
+    if (-not $cfOk -and ($now - $script:lastCfRestart) -gt $cooldown) {
+        $script:lastCfRestart = $now
         Add-Log "watchdog" "cloudflared not running — auto-restarting..."
         [OllamaLogger]::KillAllByName("cloudflared")
         $script:cfProc = $null
-        Start-Sleep -Seconds 1
         Start-Tunnel
         $tray.ShowBalloonTip(3000, "Ollama Tunnel", "Tunnel crashed — auto-restarted", [System.Windows.Forms.ToolTipIcon]::Warning)
     }
@@ -275,7 +334,7 @@ $watchdogTimer.Add_Tick({
 })
 $watchdogTimer.Start()
 
-# ── Tray icon ─────────────────────────────────────────────────────────────────
+# ── Tray icon ──────────────────────────────────────────────────────────────────
 $tray         = New-Object System.Windows.Forms.NotifyIcon
 $tray.Text    = "Ollama Tunnel"
 $tray.Visible = $true
@@ -284,9 +343,11 @@ $bmp = New-Object System.Drawing.Bitmap 16, 16
 $g   = [System.Drawing.Graphics]::FromImage($bmp)
 $g.FillEllipse([System.Drawing.Brushes]::DodgerBlue, 1, 1, 13, 13)
 $g.Dispose()
-$tray.Icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+$script:hIcon = $bmp.GetHicon()
+$tray.Icon    = [System.Drawing.Icon]::FromHandle($script:hIcon)
+$bmp.Dispose()
 
-# ── Context menu ──────────────────────────────────────────────────────────────
+# ── Context menu ───────────────────────────────────────────────────────────────
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $itemStatus         = $menu.Items.Add("Ollama Tunnel - running")
@@ -320,8 +381,9 @@ $itemWatchLogs.Add_Click({
     $f.Controls.Add($tb)
     $f.Tag = $tb
 
-    $script:logLastIndex = 0
-    foreach ($line in $script:logLines) {
+    # Dump buffered logs into the new window
+    $snapshot = $script:logLines.ToArray()
+    foreach ($line in $snapshot) {
         if ($line -match "error|ERR|fatal|FATAL|failed|panic") {
             $tb.SelectionColor = [System.Drawing.Color]::OrangeRed
         } elseif ($line -match "^\[ollama\]") {
@@ -354,8 +416,9 @@ $itemRestart = $menu.Items.Add("Restart Tunnel")
 $itemRestart.Add_Click({
     Add-Log "tray" "Restarting tunnel..."
     [OllamaLogger]::KillAllByName("cloudflared")
+    [OllamaLogger]::WaitForExit("cloudflared", 3000)
     $script:cfProc = $null
-    Start-Sleep -Seconds 2
+    $script:lastCfRestart = [DateTime]::UtcNow
     Start-Tunnel
     $tray.ShowBalloonTip(2000, "Ollama Tunnel", "Tunnel restarted", [System.Windows.Forms.ToolTipIcon]::Info)
 })
@@ -365,9 +428,13 @@ $itemRestartOllama = $menu.Items.Add("Restart Ollama")
 $itemRestartOllama.Add_Click({
     Add-Log "tray" "Restarting Ollama (killing all llama processes)..."
     [OllamaLogger]::KillAllByPrefix("llama-server")
+    [OllamaLogger]::WaitForExitByPrefix("llama-server", 3000)
     [OllamaLogger]::KillAllByPrefix("ollama")
-    $script:ollamaProc = $null
-    Start-Sleep -Seconds 3
+    [OllamaLogger]::WaitForExitByPrefix("ollama", 3000)
+    $script:ollamaProc  = $null
+    $script:tailStop[0] = 1
+    $script:tailThread  = $null
+    $script:lastOllamaRestart = [DateTime]::UtcNow
     Start-Ollama
     $tray.ShowBalloonTip(2000, "Ollama Tunnel", "Ollama restarted", [System.Windows.Forms.ToolTipIcon]::Info)
 })
@@ -379,8 +446,12 @@ $itemExit = $menu.Items.Add("Exit (stops Ollama + Tunnel)")
 $itemExit.Add_Click({
     $drainTimer.Stop()
     $watchdogTimer.Stop()
-    Add-Log "tray" "Stopping all services..."
+    Add-Log "tray" "Shutting down — stopping all services..."
     Stop-All
+    # Clean up GDI icon handle
+    if ($script:hIcon -ne [IntPtr]::Zero) {
+        try { [System.Drawing.Icon]::FromHandle($script:hIcon).Destroy() } catch {}
+    }
     $tray.Visible = $false
     $tray.Dispose()
     [System.Windows.Forms.Application]::Exit()
@@ -389,5 +460,5 @@ $itemExit.Add_Click({
 $tray.ContextMenuStrip = $menu
 $tray.ShowBalloonTip(3000, "Ollama Tunnel", "Ollama + cloudflared running`nollamav2.invoxio.work", [System.Windows.Forms.ToolTipIcon]::Info)
 
-# ── Message loop ──────────────────────────────────────────────────────────────
+# ── Message loop ───────────────────────────────────────────────────────────────
 [System.Windows.Forms.Application]::Run()
