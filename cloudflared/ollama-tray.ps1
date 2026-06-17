@@ -167,9 +167,12 @@ $script:hIcon             = [IntPtr]::Zero
 function Add-Log {
     param([string]$prefix, [string]$line)
     if ([string]::IsNullOrEmpty($line)) { return }
-    lock ($script:logLines.SyncRoot) {
+    [System.Threading.Monitor]::Enter($script:logLines.SyncRoot)
+    try {
         $script:logLines.Add("[$prefix] $line") | Out-Null
         if ($script:logLines.Count -gt 2000) { $script:logLines.RemoveAt(0) }
+    } finally {
+        [System.Threading.Monitor]::Exit($script:logLines.SyncRoot)
     }
 }
 
